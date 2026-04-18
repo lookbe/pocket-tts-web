@@ -16,7 +16,6 @@ const MODELS = {
     voices: './voices.bin'
 };
 
-
 const SAMPLE_RATE = 24000;
 const SAMPLES_PER_FRAME = 1920;
 const MAX_FRAMES = 500;
@@ -38,14 +37,11 @@ let mimiDecoderSession = null;
 let tokenizerProcessor = null;
 let tokenizerModelB64 = null;
 let predefinedVoices = {};
-let stTensors = {}; // Optimization: Pre-allocated s/t tensors for max LSD
+let stTensors = []; // Optimization: Pre-allocated s/t tensors for max LSD
 let isGenerating = false;
 let isReady = false;
 
-
-
 // Dynamic LSD (Latent Solver/Diffusion steps)
-
 const MAX_LSD = 10;  // Default/max quality
 let currentLSD = MAX_LSD;
 
@@ -242,88 +238,69 @@ function dedupPunctuation(text) {
     return text.replace(/\.\.\.+/g, '[ELLIPSIS]').replace(/,+/g, ',').replace(/[.,]*\.[.,]*/g, '.').replace(/[.,!]*![.,!]*/g, '!').replace(/[.,!?]*\?[.,!?]*/g, '?').replace(/\[ELLIPSIS\]/g, '...');
 }
 
-function findBoundaryIndices(tokenIds, boundaryTokenSet) {
-    const indices = [0];
-    let previousWasBoundary = false;
-    for (let i = 0; i < tokenIds.length; i++) {
-        const isBoundary = boundaryTokenSet.has(tokenIds[i]);
-        if (isBoundary) {
-            previousWasBoundary = true;
-        } else {
-            if (previousWasBoundary) indices.push(i);
-            previousWasBoundary = false;
-        }
-    }
-    indices.push(tokenIds.length);
-    return indices;
+const SENTENCE_SPLIT_RE = /[^.!?]+[.!?]+|[^.!?]+$/g;
+
+function splitTextIntoSentences(text) {
+    const matches = text.match(SENTENCE_SPLIT_RE);
+    if (!matches) return [];
+    return matches.map(sentence => sentence.trim()).filter(Boolean);
 }
 
-function segmentsFromBoundaries(tokenIds, boundaryIndices) {
-    const segments = [];
-    for (let i = 0; i < boundaryIndices.length - 1; i++) {
-        const start = boundaryIndices[i];
-        const end = boundaryIndices[i + 1];
-        const segIds = tokenIds.slice(start, end);
-        const text = tokenizerProcessor.decodeIds(segIds);
-        segments.push([end - start, text]);
+function splitTokenIdsIntoChunks(tokenIds, maxTokens) {
+    const chunks = [];
+    for (let i = 0; i < tokenIds.length; i += maxTokens) {
+        const chunkText = tokenizerProcessor.decodeIds(tokenIds.slice(i, i + maxTokens)).trim();
+        if (chunkText) chunks.push(chunkText);
     }
-    return segments;
+    return chunks;
 }
 
-// Split text into chunks similar to Python split_into_best_sentences.
+// Split text into sentence chunks (target <= CHUNK_TARGET_TOKENS tokens)
 function splitIntoBestSentences(text) {
     const preparedText = prepareText(text);
     if (!preparedText) return [];
 
-    const allTokenIds = tokenizerProcessor.encodeIds(preparedText);
-    if (allTokenIds.length === 0) return [];
+    const sentences = splitTextIntoSentences(preparedText);
+    if (sentences.length === 0) return [];
 
-    const eosTokens = tokenizerProcessor.encodeIds('.!...?').slice(1);
-    const sentenceBoundaries = findBoundaryIndices(allTokenIds, new Set(eosTokens));
-    const coarseSegments = segmentsFromBoundaries(allTokenIds, sentenceBoundaries);
-
-    const fallbackTokens = tokenizerProcessor.encodeIds(',;:').slice(1);
-    const fallbackSet = new Set(fallbackTokens);
-    const refinedSegments = [];
-
-    for (const [nbTokens, sentenceText] of coarseSegments) {
-        if (nbTokens <= CHUNK_TARGET_TOKENS) {
-            refinedSegments.push([nbTokens, sentenceText]);
-            continue;
-        }
-
-        const subTokenIds = tokenizerProcessor.encodeIds(sentenceText.trim());
-        const subBoundaries = findBoundaryIndices(subTokenIds, fallbackSet);
-        const subSegments = segmentsFromBoundaries(subTokenIds, subBoundaries);
-        if (subSegments.length > 1) {
-            refinedSegments.push(...subSegments);
-        } else {
-            refinedSegments.push([nbTokens, sentenceText]);
-        }
-    }
-
+    // Merge sentences into chunks that stay within the token target
     const chunks = [];
     let currentChunk = '';
-    let currentTokens = 0;
+    for (const sentenceText of sentences) {
+        const sentenceTokenIds = tokenizerProcessor.encodeIds(sentenceText);
+        const sentenceTokens = sentenceTokenIds.length;
 
-    for (const [nbTokens, sentence] of refinedSegments) {
-        if (currentChunk === '') {
-            currentChunk = sentence;
-            currentTokens = nbTokens;
+        if (sentenceTokens > CHUNK_TARGET_TOKENS) {
+            if (currentChunk !== '') {
+                chunks.push(currentChunk.trim());
+                currentChunk = '';
+            }
+            const splitChunks = splitTokenIdsIntoChunks(sentenceTokenIds, CHUNK_TARGET_TOKENS);
+            for (const splitChunk of splitChunks) {
+                if (splitChunk) chunks.push(splitChunk.trim());
+            }
             continue;
         }
 
-        if (currentTokens + nbTokens > CHUNK_TARGET_TOKENS) {
+        if (currentChunk === '') {
+            currentChunk = sentenceText;
+            continue;
+        }
+
+        const combined = `${currentChunk} ${sentenceText}`;
+        const combinedTokens = tokenizerProcessor.encodeIds(combined).length;
+        if (combinedTokens > CHUNK_TARGET_TOKENS) {
             chunks.push(currentChunk.trim());
-            currentChunk = sentence;
-            currentTokens = nbTokens;
+            currentChunk = sentenceText;
         } else {
-            currentChunk += ' ' + sentence;
-            currentTokens += nbTokens;
+            currentChunk = combined;
         }
     }
 
-    if (currentChunk !== '') chunks.push(currentChunk.trim());
+    if (currentChunk !== '') {
+        chunks.push(currentChunk.trim());
+    }
+
     return chunks;
 }
 
@@ -331,9 +308,30 @@ function splitIntoBestSentences(text) {
 function prepareText(text) {
     text = text.trim();
     if (!text) return '';
-    text = text.replace(/\n/g, ' ').replace(/\r/g, ' ');
-    text = text.replace(/ {2,}/g, ' ').trim();
-    if (!text) return '';
+
+    // Convert to ASCII
+    text = convertToAscii(text);
+
+    // Normalize numbers first
+    text = normalizeNumbers(text);
+
+    // Normalize special characters
+    text = normalizeSpecial(text);
+
+    // Expand abbreviations
+    text = expandAbbreviations(text);
+
+    // Expand special characters
+    text = expandSpecialCharacters(text);
+
+    // Collapse whitespace
+    text = collapseWhitespace(text);
+
+    // Deduplicate punctuation
+    text = dedupPunctuation(text);
+
+    // Final cleanup
+    text = text.trim();
 
     // Ensure proper punctuation at end
     if (text && text[text.length - 1].match(/[a-zA-Z0-9]/)) {
@@ -511,6 +509,7 @@ async function loadModels(force = false) {
             executionProviders: ['wasm'],
             graphOptimizationLevel: 'all'
         };
+
         // Load all models in parallel
         postMessage({ type: 'status', status: 'Loading MIMI encoder...', state: 'loading' });
         if (DEBUG_LOGS) {
@@ -596,15 +595,12 @@ async function loadModels(force = false) {
             console.warn('Could not load predefined voices:', e);
         }
 
-        // Predefined voices and other initialization
-
         if (currentVoiceEmbedding && currentVoiceName) {
             await ensureVoiceConditioningCached(currentVoiceName, currentVoiceEmbedding, {
                 force: true,
                 statusText: `Loading voice conditioning (${currentVoiceName})...`
             });
         }
-
 
         // Send list of available voices
         postMessage({
@@ -705,18 +701,8 @@ async function encodeVoiceAudio(audioData) {
 }
 
 async function buildVoiceConditionedState(voiceEmb) {
-    const flowLmState = initStateFromSession(flowLmMainSession);
+    const flowLmState = initState(flowLmMainSession, FLOW_LM_STATE_SHAPES);
     const emptySeq = new ort.Tensor('float32', new Float32Array(0), [1, 0, 32]);
-    
-    // voiceEmb.data is shape [B, numFrames, dim]
-    // In v2, mimi_encoder already outputs 1024-dim pre-normalized and projected latents
-    const targetDim = 1024;
-    
-    if (voiceEmb.shape[2] !== targetDim) {
-        console.warn(`Voice embedding dimension mismatch: expected ${targetDim}, got ${voiceEmb.shape[2]}`);
-    }
-    
-    // Create voice tensor.
     const voiceTensor = new ort.Tensor('float32', voiceEmb.data, voiceEmb.shape);
 
     const voiceCondInputs = {
@@ -724,7 +710,6 @@ async function buildVoiceConditionedState(voiceEmb) {
         text_embeddings: voiceTensor,
         ...flowLmState
     };
-
 
     const condResult = await flowLmMainSession.run(voiceCondInputs);
     for (let i = 2; i < flowLmMainSession.outputNames.length; i++) {
@@ -765,10 +750,13 @@ async function ensureVoiceConditioningCached(voiceName, voiceEmb, options = {}) 
     return conditionedState;
 }
 
+// Hardcoded state shapes extracted from ONNX model metadata
+// These are the initial shapes - dynamic dimensions start at 0
 const FLOW_LM_STATE_SHAPES = {
+    // KV cache layers: [kv=2, batch=1, max_seq=1000, heads=16, head_dim=64]
     state_0: { shape: [2, 1, 1000, 16, 64], dtype: 'float32' },
-    state_1: { shape: [0], dtype: 'float32' },
-    state_2: { shape: [1], dtype: 'int64' },
+    state_1: { shape: [0], dtype: 'float32' },  // dynamic
+    state_2: { shape: [1], dtype: 'int64' },    // step counter
     state_3: { shape: [2, 1, 1000, 16, 64], dtype: 'float32' },
     state_4: { shape: [0], dtype: 'float32' },
     state_5: { shape: [1], dtype: 'int64' },
@@ -795,17 +783,17 @@ const MIMI_DECODER_STATE_SHAPES = {
     state_5: { shape: [1], dtype: 'bool' },
     state_6: { shape: [1, 256, 2], dtype: 'float32' },
     state_7: { shape: [1], dtype: 'bool' },
-    state_8: { shape: [1, 128, 0], dtype: 'float32' },
+    state_8: { shape: [1, 128, 0], dtype: 'float32' },  // dynamic
     state_9: { shape: [1, 128, 5], dtype: 'float32' },
     state_10: { shape: [1], dtype: 'bool' },
     state_11: { shape: [1, 128, 2], dtype: 'float32' },
     state_12: { shape: [1], dtype: 'bool' },
-    state_13: { shape: [1, 64, 0], dtype: 'float32' },
+    state_13: { shape: [1, 64, 0], dtype: 'float32' },  // dynamic
     state_14: { shape: [1, 64, 4], dtype: 'float32' },
     state_15: { shape: [1], dtype: 'bool' },
     state_16: { shape: [1, 64, 2], dtype: 'float32' },
     state_17: { shape: [1], dtype: 'bool' },
-    state_18: { shape: [1, 32, 0], dtype: 'float32' },
+    state_18: { shape: [1, 32, 0], dtype: 'float32' },  // dynamic
     state_19: { shape: [2, 1, 8, 1000, 64], dtype: 'float32' },
     state_20: { shape: [1], dtype: 'int64' },
     state_21: { shape: [1], dtype: 'int64' },
@@ -819,7 +807,7 @@ const MIMI_DECODER_STATE_SHAPES = {
     state_29: { shape: [1], dtype: 'bool' },
     state_30: { shape: [1, 64, 2], dtype: 'float32' },
     state_31: { shape: [1], dtype: 'bool' },
-    state_32: { shape: [1, 32, 0], dtype: 'float32' },
+    state_32: { shape: [1, 32, 0], dtype: 'float32' },  // dynamic
     state_33: { shape: [1], dtype: 'bool' },
     state_34: { shape: [1, 512, 2], dtype: 'float32' },
     state_35: { shape: [1], dtype: 'bool' },
@@ -827,13 +815,13 @@ const MIMI_DECODER_STATE_SHAPES = {
     state_37: { shape: [1], dtype: 'bool' },
     state_38: { shape: [1, 128, 2], dtype: 'float32' },
     state_39: { shape: [1], dtype: 'bool' },
-    state_40: { shape: [1, 64, 0], dtype: 'float32' },
+    state_40: { shape: [1, 64, 0], dtype: 'float32' },  // dynamic
     state_41: { shape: [1], dtype: 'bool' },
     state_42: { shape: [1, 128, 5], dtype: 'float32' },
     state_43: { shape: [1], dtype: 'bool' },
     state_44: { shape: [1, 256, 2], dtype: 'float32' },
     state_45: { shape: [1], dtype: 'bool' },
-    state_46: { shape: [1, 128, 0], dtype: 'float32' },
+    state_46: { shape: [1, 128, 0], dtype: 'float32' },  // dynamic
     state_47: { shape: [1], dtype: 'bool' },
     state_48: { shape: [1, 256, 6], dtype: 'float32' },
     state_49: { shape: [2, 1, 8, 1000, 64], dtype: 'float32' },
@@ -845,52 +833,41 @@ const MIMI_DECODER_STATE_SHAPES = {
     state_55: { shape: [1, 512, 16], dtype: 'float32' },
 };
 
-function initStateFromSession(session) {
+function initState(session, stateShapes) {
+    /**
+     * Initialize state tensors for a stateful ONNX model using hardcoded shapes.
+     */
     const state = {};
-    const stateShapes = session === mimiDecoderSession ? MIMI_DECODER_STATE_SHAPES : FLOW_LM_STATE_SHAPES;
-    const inputsMetadata = session.inputs || (session.handler ? session.handler.inputs : null) || {};
 
-    
-    // Discover all state inputs from session metadata
-    for (const name of session.inputNames) {
-        if (!name.startsWith('state_')) continue;
-        
-        const input = inputsMetadata[name];
-        let dims, type;
+    for (const inputName of session.inputNames) {
+        if (inputName.startsWith('state_')) {
+            const stateInfo = stateShapes[inputName];
+            if (!stateInfo) {
+                console.warn(`Unknown state input: ${inputName}, skipping`);
+                continue;
+            }
 
-        if (input && input.dims && input.type) {
-            // Resolve dynamic/symbolic dimensions from metadata
-            dims = input.dims.map(dim => {
-                if (typeof dim === 'string' || dim <= 0) {
-                    if (name.includes('cache') || name.includes('state_15') || name.includes('state_12')) return 1000;
-                    if (name.endsWith('_end')) return 0;
-                    return 1;
-                }
-                return dim;
-            });
-            type = input.type.includes('float') ? 'float32' : (input.type.includes('bool') ? 'bool' : 'int64');
-        } else if (stateShapes[name]) {
-            // Fallback to hardcoded v2 shapes if metadata is missing
-            dims = [...stateShapes[name].shape];
-            type = stateShapes[name].dtype;
-        } else {
-            console.warn(`No metadata or fallback for input: ${name}`);
-            continue;
+            const { shape, dtype } = stateInfo;
+            const size = shape.reduce((a, b) => a * b, 1);
+
+            let data;
+            if (dtype === 'int64') {
+                data = new BigInt64Array(size);
+            } else if (dtype === 'bool') {
+                data = new Uint8Array(size);
+            } else {
+                data = new Float32Array(size);
+            }
+
+            state[inputName] = new ort.Tensor(dtype, data, shape);
+            if (DEBUG_LOGS) {
+                console.log(`Init state ${inputName}: shape=${JSON.stringify(shape)}, dtype=${dtype}`);
+            }
         }
-        
-        const size = dims.reduce((a, b) => a * b, 1);
-        let data;
-        if (type === 'float32') data = new Float32Array(size);
-        else if (type === 'bool') data = new Uint8Array(size); 
-        else data = new BigInt64Array(size);
-        
-        state[name] = new ort.Tensor(type, data, dims);
     }
+
     return state;
 }
-
-
-
 
 async function startGeneration(text, voiceName) {
     isGenerating = true;
@@ -946,7 +923,7 @@ async function startGeneration(text, voiceName) {
 
 async function runGenerationPipeline(voiceName, chunks) {
     // Initialize state - may be reset per chunk
-    let mimiState = initStateFromSession(mimiDecoderSession);
+    let mimiState = initState(mimiDecoderSession, MIMI_DECODER_STATE_SHAPES);
     const emptySeq = new ort.Tensor('float32', new Float32Array(0), [1, 0, 32]);
     const emptyTextEmb = new ort.Tensor('float32', new Float32Array(0), [1, 0, 1024]);
     const baseFlowState = voiceConditioningCache.get(voiceName);
@@ -975,7 +952,7 @@ async function runGenerationPipeline(voiceName, chunks) {
             flowLmState = cloneFlowState(baseFlowState);
         }
         if (RESET_MIMI_STATE_EACH_CHUNK && chunkIdx > 0) {
-            mimiState = initStateFromSession(mimiDecoderSession);
+            mimiState = initState(mimiDecoderSession, MIMI_DECODER_STATE_SHAPES);
         }
 
         const chunkText = chunks[chunkIdx];
