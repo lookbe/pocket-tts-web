@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pocket TTS - Neural Voice Cloning in Your Browser</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600;700&family=Nunito:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- ONNX Runtime Web (loaded by worker, kept here for potential main thread usage) -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.0/dist/ort.min.js"></script>
+</head>
+
+<body>
+    <!-- Ambient Background Effects -->
+    <div class="ambient-layer">
+        <div class="orb orb--primary"></div>
+        <div class="orb orb--secondary"></div>
+        <div class="orb orb--tertiary"></div>
+        <div class="grid-overlay"></div>
+    </div>
+
+    <div class="app-shell">
+        <!-- Hero Header -->
+        <header class="hero">
+            <div class="hero__brand">
+                <div class="logo">
+                    <svg class="logo__icon" viewBox="0 0 32 32" fill="none">
+                        <path d="M16 4C16 4 8 8 8 16C8 24 16 28 16 28" stroke="url(#logoGrad)" stroke-width="2.5" stroke-linecap="round"/>
+                        <path d="M16 4C16 4 24 8 24 16C24 24 16 28 16 28" stroke="url(#logoGrad)" stroke-width="2.5" stroke-linecap="round"/>
+                        <path d="M12 10V22" stroke="url(#logoGrad)" stroke-width="2.5" stroke-linecap="round"/>
+                        <path d="M16 8V24" stroke="url(#logoGrad)" stroke-width="2.5" stroke-linecap="round"/>
+                        <path d="M20 10V22" stroke="url(#logoGrad)" stroke-width="2.5" stroke-linecap="round"/>
+                        <defs>
+                            <linearGradient id="logoGrad" x1="8" y1="4" x2="24" y2="28" gradientUnits="userSpaceOnUse">
+                                <stop stop-color="#3eb489"/>
+                                <stop offset="0.5" stop-color="#00d4aa"/>
+                                <stop offset="1" stop-color="#7fffd4"/>
+                            </linearGradient>
+                        </defs>
+                    </svg>
+                    <span class="logo__text">Pocket TTS</span>
+                </div>
+                <div class="hero__badge">
+                    <span class="badge">ONNX Runtime</span>
+                </div>
+            </div>
+            <p class="hero__tagline">Real-time neural text-to-speech with voice cloning, running entirely in your browser</p>
+        </header>
+
+        <main class="main">
+            <!-- Input Section -->
+            <section class="input-section">
+                <!-- Voice Selection -->
+                <div class="voice-section">
+                    <div class="voice-selector">
+                        <label for="voice-select" class="voice-selector__label">Voice</label>
+                        <select id="voice-select" class="voice-selector__dropdown">
+                            <option value="">Loading voices...</option>
+                        </select>
+                    </div>
+                    <div class="voice-upload">
+                        <button id="voice-upload-btn" class="btn btn--outline btn--small">
+                            <svg class="btn__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                <polyline points="17 8 12 3 7 8"/>
+                                <line x1="12" y1="3" x2="12" y2="15"/>
+                            </svg>
+                            <span>Upload Voice</span>
+                        </button>
+                        <input type="file" id="voice-upload" accept="audio/*" hidden>
+                        <span id="voice-upload-status" class="voice-upload-status"></span>
+                    </div>
+                </div>
+
+                <div class="textarea-wrap">
+                    <textarea
+                        id="text-input"
+                        placeholder="Type or paste text to synthesize..."
+                        aria-label="Text to synthesize"
+                    ></textarea>
+                    <div class="textarea-meta">
+                        <span class="char-count"><span id="char-count">0</span> chars</span>
+                    </div>
+                </div>
+
+                <!-- Sample Texts -->
+                <div class="sample-texts">
+                    <span class="sample-texts__label">Try:</span>
+                    <button class="sample-btn" data-text="Hello, welcome to Pocket TTS. This is a demonstration of real-time voice cloning running entirely in your browser.">Demo greeting</button>
+                    <button class="sample-btn" data-text="I completely understand how frustrating this must be for you. Let me take care of this right away and make sure we get it resolved.">Empathetic support</button>
+                    <button class="sample-btn" data-text="Wow, congratulations! That's absolutely fantastic news! I'm so thrilled for you!">Excited</button>
+                    <button class="sample-btn" data-text="I'm really sorry to hear about your loss. Please know that we're here for you, and take all the time you need.">Compassionate</button>
+                    <button class="sample-btn" data-text="Great question! I'd be happy to walk you through this step by step. First, let's start with the basics.">Helpful guide</button>
+                </div>
+
+                <div class="controls">
+                    <button id="generate-btn" class="btn btn--primary">
+                        <svg class="btn__icon" viewBox="0 0 24 24" fill="currentColor">
+                            <polygon points="5,3 19,12 5,21"/>
+                        </svg>
+                        <span class="btn__text">Generate Audio</span>
+                        <div class="btn__loader" id="btn-loader"></div>
+                    </button>
+                    <button id="stop-btn" class="btn btn--secondary" disabled>
+                        <svg class="btn__icon" viewBox="0 0 24 24" fill="currentColor">
+                            <rect x="6" y="6" width="12" height="12" rx="1"/>
+                        </svg>
+                        <span class="btn__text">Stop</span>
+                    </button>
+                </div>
+            </section>
+
+            <!-- Output Section: Visualizer + Metrics -->
+            <section class="output-section">
+                <div class="visualizer-panel">
+                    <div class="visualizer-panel__header">
+                        <span class="visualizer-panel__title">Audio Output</span>
+                        <div class="status-indicator" id="status-indicator">
+                            <span class="status-dot"></span>
+                            <span class="status-text" id="stat-status">Idle</span>
+                        </div>
+                    </div>
+                    <div class="visualizer-container">
+                        <canvas id="visualizer-waveform"></canvas>
+                        <canvas id="visualizer-bars" class="visualizer-bars"></canvas>
+                    </div>
+                </div>
+
+                <div class="metrics-panel">
+                    <h3 class="metrics-panel__title">Performance</h3>
+
+                    <div class="metric">
+                        <div class="metric__header">
+                            <span class="metric__label">Time to First Byte</span>
+                            <button class="metric__info" aria-label="TTFB explanation" data-tooltip="Time from request until first audio chunk is received">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="10"/>
+                                    <path d="M12 16v-4M12 8h.01"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="metric__value">
+                            <span class="metric__number" id="stat-ttfb">--</span>
+                            <span class="metric__unit">ms</span>
+                        </div>
+                        <div class="metric__bar">
+                            <div class="metric__bar-fill" id="ttfb-bar"></div>
+                        </div>
+                    </div>
+
+                    <div class="metric metric--highlight">
+                        <div class="metric__header">
+                            <span class="metric__label">Real-Time Factor</span>
+                            <button class="metric__info" aria-label="RTFx explanation" data-tooltip="Audio duration divided by processing time. Values above 1x mean faster than real-time playback.">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="10"/>
+                                    <path d="M12 16v-4M12 8h.01"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="metric__value">
+                            <span class="metric__number metric__number--large" id="stat-rtfx">--</span>
+                            <span class="metric__unit">x</span>
+                        </div>
+                        <div class="metric__context" id="rtfx-context">&gt;1x = faster than real-time</div>
+                        <div class="metric__note" id="edge-opt-note" style="display: none;">(edge optimization applied)</div>
+                        <div class="metric__note" id="full-gen-note" style="display: none;">(waiting for full generation first)</div>
+                    </div>
+
+                    <div class="metric metric--status">
+                        <span class="metric__label">Model</span>
+                        <div class="model-status" id="model-status">
+                            <span class="model-status__dot"></span>
+                            <span class="model-status__text">Not loaded</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <footer class="footer">
+            <p><a href="https://github.com/kyutai-labs/pocket-tts" target="_blank" rel="noopener">Pocket TTS</a> by <a href="https://kyutai.org" target="_blank" rel="noopener">Kyutai</a>. This is an unofficial demo.</p>
+            <p class="footer__disclaimer">Do not use for voice cloning without consent, misinformation, fraud, or any harmful/illegal purpose. All liability disclaimed.</p>
+        </footer>
+    </div>
+
+    <script type="module" src="onnx-streaming.js?v=1"></script>
+</body>
+
+</html>
