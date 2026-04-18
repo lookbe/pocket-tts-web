@@ -1,21 +1,3 @@
----
-title: Pocket TTS ONNX Web Demo
-emoji: 🌖
-colorFrom: yellow
-colorTo: pink
-sdk: static
-app_file: index.html
-pinned: false
-license: cc-by-4.0
-short_description: Real-time voice cloning entirely in your browser! (CPU)
-models:
-  - KevinAHM/pocket-tts-onnx
-custom_headers:
-  cross-origin-embedder-policy: require-corp
-  cross-origin-opener-policy: same-origin
-  cross-origin-resource-policy: cross-origin
----
-
 # Pocket TTS Web Demo
 
 Real-time neural text-to-speech with voice cloning, running entirely in your browser.
