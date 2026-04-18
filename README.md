@@ -49,9 +49,9 @@ pocket-tts-web/
 ├── EventEmitter.js         # Event utilities
 ├── sentencepiece.js        # SentencePiece tokenizer library
 ├── style.css               # Styles
-├── tokenizer.model         # SentencePiece model
 ├── voices.bin              # Predefined voice embeddings
-└── onnx/
+└── models/
+    ├── tokenizer.model
     ├── mimi_encoder.onnx
     ├── text_conditioner.onnx
     ├── flow_lm_main_int8.onnx
