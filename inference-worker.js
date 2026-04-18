@@ -7,12 +7,12 @@ let ort = null;
 
 // Configuration
 const MODELS = {
-    mimi_encoder: './model/mimi_encoder.onnx',
-    text_conditioner: './model/text_conditioner.onnx',
-    flow_lm_main: './model/flow_lm_main_int8.onnx',
-    flow_lm_flow: './model/flow_lm_flow_int8.onnx',
-    mimi_decoder: './model/mimi_decoder_int8.onnx',
-    tokenizer: './model/tokenizer.model',
+    mimi_encoder: './models/mimi_encoder.onnx',
+    text_conditioner: './models/text_conditioner.onnx',
+    flow_lm_main: './models/flow_lm_main_int8.onnx',
+    flow_lm_flow: './models/flow_lm_flow_int8.onnx',
+    mimi_decoder: './models/mimi_decoder_int8.onnx',
+    tokenizer: './models/tokenizer.model',
     voices: './voices.bin'
 };
 
