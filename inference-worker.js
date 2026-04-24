@@ -12,6 +12,7 @@ const MODELS = {
     flow_lm_main: './models/flow_lm_main_int8.onnx',
     flow_lm_flow: './models/flow_lm_flow_int8.onnx',
     mimi_decoder: './models/mimi_decoder_int8.onnx',
+    bos_before_voice: './models/bos_before_voice.npy',
     tokenizer: './models/tokenizer.model',
     voices: './voices.bin'
 };
@@ -49,6 +50,7 @@ let currentLSD = MAX_LSD;
 let currentVoiceEmbedding = null;
 let currentVoiceName = null;
 let voiceConditioningCache = new Map();
+let bosBeforeVoiceEmbedding = null;
 
 // Text preprocessing utilities
 const ONES = ['', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
@@ -456,6 +458,7 @@ async function loadModels(force = false) {
         mimiDecoderSession = null;
         tokenizerProcessor = null;
         voiceConditioningCache.clear();
+        bosBeforeVoiceEmbedding = null;
     }
 
     const cacheBust = Date.now(); // Cache-busting timestamp for development
@@ -563,6 +566,20 @@ async function loadModels(force = false) {
             console.log('Tokenizer loaded');
         }
 
+        // Load optional BOS-before-voice embedding used for initial voice conditioning.
+        try {
+            const bosResponse = await fetch(`${MODELS.bos_before_voice}?v=${cacheBust}`, fetchOptions);
+            if (bosResponse.ok) {
+                const bosBuffer = await bosResponse.arrayBuffer();
+                bosBeforeVoiceEmbedding = parseNpyFloat32(bosBuffer);
+                console.log(`[bos] loaded bos_before_voice.npy shape=${JSON.stringify(bosBeforeVoiceEmbedding.shape)}`);
+            } else {
+                console.warn('[bos] bos_before_voice.npy not found, continuing without BOS-before-voice injection.');
+            }
+        } catch (e) {
+            console.warn('[bos] Failed to load bos_before_voice.npy, continuing without BOS-before-voice injection:', e);
+        }
+
         // Load predefined voices
         postMessage({ type: 'status', status: 'Loading voices...', state: 'loading' });
         if (DEBUG_LOGS) {
@@ -640,6 +657,85 @@ async function loadModels(force = false) {
     }
 }
 
+function parseNpyFloat32(buffer) {
+    const view = new DataView(buffer);
+    const magic = String.fromCharCode(
+        view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3), view.getUint8(4), view.getUint8(5)
+    );
+    if (magic !== '\x93NUMPY') {
+        throw new Error('Invalid NPY magic header');
+    }
+
+    const major = view.getUint8(6);
+    const minor = view.getUint8(7);
+    let headerLen;
+    let offset;
+    if (major === 1) {
+        headerLen = view.getUint16(8, true);
+        offset = 10;
+    } else if (major === 2 || major === 3) {
+        headerLen = view.getUint32(8, true);
+        offset = 12;
+    } else {
+        throw new Error(`Unsupported NPY version ${major}.${minor}`);
+    }
+
+    const headerBytes = new Uint8Array(buffer, offset, headerLen);
+    const header = new TextDecoder('ascii').decode(headerBytes);
+    if (!header.includes("'descr': '<f4'")) {
+        throw new Error(`Unsupported NPY dtype header: ${header}`);
+    }
+    if (!header.includes("'fortran_order': False")) {
+        throw new Error('Fortran-order NPY arrays are not supported');
+    }
+
+    const shapeMatch = header.match(/'shape':\s*\(([^)]*)\)/);
+    if (!shapeMatch) {
+        throw new Error(`Could not parse NPY shape from header: ${header}`);
+    }
+    const shape = shapeMatch[1]
+        .split(',')
+        .map(s => s.trim())
+        .filter(s => s.length > 0)
+        .map(Number);
+
+    const dataOffset = offset + headerLen;
+    const dataBytes = buffer.byteLength - dataOffset;
+    if (dataBytes % 4 !== 0) {
+        throw new Error(`Invalid NPY float32 byte length: ${dataBytes}`);
+    }
+    const data = new Float32Array(buffer, dataOffset, dataBytes / 4);
+    return { data: new Float32Array(data), shape };
+}
+
+function prependBosBeforeVoice(voiceEmb) {
+    if (!bosBeforeVoiceEmbedding) {
+        return voiceEmb;
+    }
+    const bosShape = bosBeforeVoiceEmbedding.shape;
+    if (bosShape.length !== 3 || bosShape[0] !== 1 || bosShape[2] !== 1024) {
+        console.warn(`[bos] Unexpected bos_before_voice shape: ${JSON.stringify(bosShape)}; skipping prepend.`);
+        return voiceEmb;
+    }
+    if (!voiceEmb || !voiceEmb.shape || voiceEmb.shape.length !== 3 || voiceEmb.shape[0] !== 1 || voiceEmb.shape[2] !== 1024) {
+        console.warn(`[bos] Unexpected voice embedding shape: ${JSON.stringify(voiceEmb?.shape)}; skipping prepend.`);
+        return voiceEmb;
+    }
+
+    const bosFrames = bosShape[1];
+    const voiceFrames = voiceEmb.shape[1];
+    const embDim = 1024;
+    const outFrames = bosFrames + voiceFrames;
+    const out = new Float32Array(outFrames * embDim);
+    out.set(bosBeforeVoiceEmbedding.data, 0);
+    out.set(voiceEmb.data, bosFrames * embDim);
+
+    return {
+        data: out,
+        shape: [1, outFrames, embDim]
+    };
+}
+
 function parseVoicesBin(buffer) {
     // Simple binary format:
     // Header: 4 bytes (uint32) = number of voices
@@ -703,7 +799,8 @@ async function encodeVoiceAudio(audioData) {
 async function buildVoiceConditionedState(voiceEmb) {
     const flowLmState = initState(flowLmMainSession, FLOW_LM_STATE_SHAPES);
     const emptySeq = new ort.Tensor('float32', new Float32Array(0), [1, 0, 32]);
-    const voiceTensor = new ort.Tensor('float32', voiceEmb.data, voiceEmb.shape);
+    const voiceWithBos = prependBosBeforeVoice(voiceEmb);
+    const voiceTensor = new ort.Tensor('float32', voiceWithBos.data, voiceWithBos.shape);
 
     const voiceCondInputs = {
         sequence: emptySeq,
@@ -750,27 +847,26 @@ async function ensureVoiceConditioningCached(voiceName, voiceEmb, options = {}) 
     return conditionedState;
 }
 
-// Hardcoded state shapes extracted from ONNX model metadata
-// These are the initial shapes - dynamic dimensions start at 0
+// Hardcoded state shapes extracted from ONNX model metadata.
+// Keep these in sync with files under ./models/*.onnx.
 const FLOW_LM_STATE_SHAPES = {
-    // KV cache layers: [kv=2, batch=1, max_seq=1000, heads=16, head_dim=64]
-    state_0: { shape: [2, 1, 1000, 16, 64], dtype: 'float32' },
-    state_1: { shape: [0], dtype: 'float32' },  // dynamic
+    state_0: { shape: [1, 1000, 16, 64], dtype: 'float16' },
+    state_1: { shape: [1, 1000, 16, 64], dtype: 'float16' },
     state_2: { shape: [1], dtype: 'int64' },    // step counter
-    state_3: { shape: [2, 1, 1000, 16, 64], dtype: 'float32' },
-    state_4: { shape: [0], dtype: 'float32' },
+    state_3: { shape: [1, 1000, 16, 64], dtype: 'float16' },
+    state_4: { shape: [1, 1000, 16, 64], dtype: 'float16' },
     state_5: { shape: [1], dtype: 'int64' },
-    state_6: { shape: [2, 1, 1000, 16, 64], dtype: 'float32' },
-    state_7: { shape: [0], dtype: 'float32' },
+    state_6: { shape: [1, 1000, 16, 64], dtype: 'float16' },
+    state_7: { shape: [1, 1000, 16, 64], dtype: 'float16' },
     state_8: { shape: [1], dtype: 'int64' },
-    state_9: { shape: [2, 1, 1000, 16, 64], dtype: 'float32' },
-    state_10: { shape: [0], dtype: 'float32' },
+    state_9: { shape: [1, 1000, 16, 64], dtype: 'float16' },
+    state_10: { shape: [1, 1000, 16, 64], dtype: 'float16' },
     state_11: { shape: [1], dtype: 'int64' },
-    state_12: { shape: [2, 1, 1000, 16, 64], dtype: 'float32' },
-    state_13: { shape: [0], dtype: 'float32' },
+    state_12: { shape: [1, 1000, 16, 64], dtype: 'float16' },
+    state_13: { shape: [1, 1000, 16, 64], dtype: 'float16' },
     state_14: { shape: [1], dtype: 'int64' },
-    state_15: { shape: [2, 1, 1000, 16, 64], dtype: 'float32' },
-    state_16: { shape: [0], dtype: 'float32' },
+    state_15: { shape: [1, 1000, 16, 64], dtype: 'float16' },
+    state_16: { shape: [1, 1000, 16, 64], dtype: 'float16' },
     state_17: { shape: [1], dtype: 'int64' },
 };
 
@@ -794,11 +890,11 @@ const MIMI_DECODER_STATE_SHAPES = {
     state_16: { shape: [1, 64, 2], dtype: 'float32' },
     state_17: { shape: [1], dtype: 'bool' },
     state_18: { shape: [1, 32, 0], dtype: 'float32' },  // dynamic
-    state_19: { shape: [2, 1, 8, 1000, 64], dtype: 'float32' },
-    state_20: { shape: [1], dtype: 'int64' },
+    state_19: { shape: [1, 250, 8, 64], dtype: 'float16' },
+    state_20: { shape: [1, 250, 8, 64], dtype: 'float16' },
     state_21: { shape: [1], dtype: 'int64' },
-    state_22: { shape: [2, 1, 8, 1000, 64], dtype: 'float32' },
-    state_23: { shape: [1], dtype: 'int64' },
+    state_22: { shape: [1, 250, 8, 64], dtype: 'float16' },
+    state_23: { shape: [1, 250, 8, 64], dtype: 'float16' },
     state_24: { shape: [1], dtype: 'int64' },
     state_25: { shape: [1], dtype: 'bool' },
     state_26: { shape: [1, 512, 16], dtype: 'float32' },
@@ -824,11 +920,11 @@ const MIMI_DECODER_STATE_SHAPES = {
     state_46: { shape: [1, 128, 0], dtype: 'float32' },  // dynamic
     state_47: { shape: [1], dtype: 'bool' },
     state_48: { shape: [1, 256, 6], dtype: 'float32' },
-    state_49: { shape: [2, 1, 8, 1000, 64], dtype: 'float32' },
-    state_50: { shape: [1], dtype: 'int64' },
+    state_49: { shape: [1, 250, 8, 64], dtype: 'float16' },
+    state_50: { shape: [1, 250, 8, 64], dtype: 'float16' },
     state_51: { shape: [1], dtype: 'int64' },
-    state_52: { shape: [2, 1, 8, 1000, 64], dtype: 'float32' },
-    state_53: { shape: [1], dtype: 'int64' },
+    state_52: { shape: [1, 250, 8, 64], dtype: 'float16' },
+    state_53: { shape: [1, 250, 8, 64], dtype: 'float16' },
     state_54: { shape: [1], dtype: 'int64' },
     state_55: { shape: [1, 512, 16], dtype: 'float32' },
 };
@@ -855,6 +951,11 @@ function initState(session, stateShapes) {
                 data = new BigInt64Array(size);
             } else if (dtype === 'bool') {
                 data = new Uint8Array(size);
+            } else if (dtype === 'float16') {
+                if (typeof Float16Array === 'undefined') {
+                    throw new Error('This browser/runtime does not support Float16Array required by ONNX Runtime Web.');
+                }
+                data = new Float16Array(size);
             } else {
                 data = new Float32Array(size);
             }

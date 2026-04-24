@@ -113,7 +113,7 @@ export class PocketTTSStreaming {
 
         // Initialize Worker (as ES module)
         console.log('Spawning Inference Worker...');
-        this.worker = new Worker('./inference-worker.js?v=15', { type: 'module' });
+        this.worker = new Worker('./inference-worker.js?v=17', { type: 'module' });
 
         this.worker.onmessage = (e) => {
             const { type, data, error, status, state, metrics, text, voices, defaultVoice, voiceName } = e.data;
